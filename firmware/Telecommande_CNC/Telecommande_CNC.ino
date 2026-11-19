@@ -36,7 +36,9 @@
    automatiquement sur le réseau, recalibrer l'écran. Tout est mémorisé.
    SONDE Z : palpage automatique avec la plaque de touche de la TTC450.
 
-   MODE IMPRIMANTE 3D (Creality K2, Klipper) : MENU > bouton du haut "MACHINE".
+   AU DÉMARRAGE : 2 tuiles, CNC ou IMPRIMANTE 3D (la dernière utilisée démarre seule après 8 s).
+   Pour changer ensuite : MENU > bouton du haut "changer de machine".
+   MODE IMPRIMANTE 3D (Creality K2, Klipper) :
    Joysticks = déplacements de la tête et du plateau (bloqués pendant une impression),
    ORIGINE = G28, CHAUFFE PLA / STOP CHAUFFE, ANNULER IMP., MOTEURS OFF / REDEMARRER,
    PAUSE = pause / reprise de l'impression, ARRÊT = arrêt d'urgence Klipper,
@@ -945,7 +947,7 @@ void gererTactile() {
 //  MENU RÉGLAGES (toucher la barre du haut de l'écran)
 // ============================================================
 const BoutonEcran bmRetour  = {4, 4, 100, 30};
-const BoutonEcran bmMachine = {110, 4, 206, 30};
+const BoutonEcran bmMachine = {110, 2, 206, 34};
 const BoutonEcran bmWifi    = {4, 150, 102, 40};
 const BoutonEcran bmIp      = {109, 150, 102, 40};
 const BoutonEcran bmCherche = {214, 150, 102, 40};
@@ -976,7 +978,8 @@ void texteInfo(const String& t, int y, uint16_t coul) {
 void ouvrirMenu() {
   ecranActif = E_MENU;
   titreEcran("");
-  dessinerBouton(bmMachine, machine == M_IMP ? "MACHINE : IMPRIMANTE 3D" : "MACHINE : CNC", machine == M_IMP ? 0x001F : 0x0400);
+  dessinerBouton(bmMachine, machine == M_IMP ? "REGLAGES IMPRIMANTE\nchanger de machine" : "REGLAGES CNC\nchanger de machine",
+                 machine == M_IMP ? 0x0010 : 0x0300);
   dessinerBouton(bmWifi, "CHOISIR\nWI-FI", 0x0410);
   dessinerBouton(bmIp, machine == M_IMP ? "IP DE\nL'IMPRIM." : "IP DE\nLA CNC", C_BOUTON);
   dessinerBouton(bmCherche, machine == M_IMP ? "CHERCHER\nL'IMPRIM." : "CHERCHER\nLA CNC", 0x8A22);
@@ -1472,6 +1475,7 @@ void testCablage() {
 
 // ---------- Changement de machine (CNC <-> imprimante 3D) ----------
 void changerMachine(int m) {
+  if (m == machine) { memoire.putInt("mach", machine); return; }
   if (jogActif) envoyerTempsReel(0x85);
   jogActif = false;
   cnc.stop();
@@ -1480,14 +1484,88 @@ void changerMachine(int m) {
   impOk = false; impEtat = "?"; klippyEtat = "?"; tImpPoll = 0;
   etatGrbl = "?"; cncAReponduConnexion = false; tTentative = 0;
   for (int a = 0; a < 3; a++) pos[a] = 0;
-  ouvrirMenu();
+}
+
+// ---------- Écran de choix de la machine (2 tuiles) ----------
+const BoutonEcran tuileCnc = {8, 44, 148, 152}, tuileImp = {164, 44, 148, 152};
+
+void dessinerTuile(const BoutonEcran& b, bool imp, bool choisie) {
+  uint16_t fond = imp ? 0x0010 : 0x0300;          // bleu nuit / vert sombre
+  ecran.fillRoundRect(b.x, b.y, b.w, b.h, 12, fond);
+  if (choisie) for (int k = 0; k < 3; k++) ecran.drawRoundRect(b.x + k, b.y + k, b.w - 2 * k, b.h - 2 * k, 12, TFT_YELLOW);
+  int cx = b.x + b.w / 2, cy = b.y + 56;
+  if (!imp) {                                       // dessin d'une CNC : portique, broche, fraise, table
+    ecran.fillRect(cx - 50, cy - 32, 100, 8, TFT_LIGHTGREY);
+    ecran.fillRect(cx - 50, cy - 32, 8, 62, TFT_LIGHTGREY);
+    ecran.fillRect(cx + 42, cy - 32, 8, 62, TFT_LIGHTGREY);
+    ecran.fillRoundRect(cx - 12, cy - 28, 24, 30, 4, TFT_ORANGE);
+    ecran.fillTriangle(cx - 4, cy + 2, cx + 4, cy + 2, cx, cy + 16, TFT_WHITE);
+    ecran.fillRect(cx - 28, cy + 18, 56, 8, 0xC618);
+    ecran.fillRect(cx - 58, cy + 28, 116, 6, 0x8410);
+  } else {                                          // dessin d'une imprimante : cadre, tête, pièce, plateau
+    ecran.drawRect(cx - 46, cy - 34, 92, 66, TFT_LIGHTGREY);
+    ecran.drawRect(cx - 45, cy - 33, 90, 64, TFT_LIGHTGREY);
+    ecran.fillRect(cx - 42, cy - 20, 84, 5, 0x8410);
+    ecran.fillRoundRect(cx - 11, cy - 26, 22, 15, 3, TFT_ORANGE);
+    ecran.fillTriangle(cx - 4, cy - 11, cx + 4, cy - 11, cx, cy - 4, TFT_WHITE);
+    ecran.fillRect(cx - 16, cy + 6, 32, 16, TFT_GREENYELLOW);
+    ecran.fillRect(cx - 38, cy + 22, 76, 5, TFT_LIGHTGREY);
+  }
+  ecran.setTextColor(TFT_WHITE, fond);
+  ecran.setTextDatum(textdatum_t::middle_center);
+  ecran.setFont(&fonts::FreeSansBold9pt7b);
+  ecran.drawString(imp ? "IMPRIMANTE 3D" : "CNC", cx, b.y + 116);
+  ecran.setFont(&fonts::FreeSans9pt7b);
+  ecran.drawString(imp ? "Creality K2" : "TTC450", cx, b.y + 138);
+}
+
+// Affiche les 2 tuiles et attend le choix. Avec lancementAuto, la dernière machine
+// utilisée démarre toute seule au bout de 8 s si on ne touche à rien.
+void choisirMachine(bool lancementAuto) {
+  if (jogActif) { envoyerTempsReel(0x85); jogActif = false; }
+  ecran.fillScreen(C_FOND);
+  ecran.fillRect(0, 0, 320, 38, C_TITRE);
+  ecran.setFont(&fonts::FreeSansBold9pt7b);
+  ecran.setTextColor(TFT_WHITE, C_TITRE);
+  ecran.setTextDatum(textdatum_t::middle_center);
+  ecran.drawString("QUELLE MACHINE ?", 160, 19);
+  dessinerTuile(tuileCnc, false, machine == M_CNC);
+  dessinerTuile(tuileImp, true, machine == M_IMP);
+  int32_t x, y;
+  unsigned long t = millis();
+  while (ecran.getTouch(&x, &y) && millis() - t < 3000) delay(20);   // attendre qu'on lâche l'écran
+  int choix = -1, restant = -1;
+  unsigned long t0 = millis();
+  while (choix < 0) {
+    if (lancementAuto) {
+      int r = 8 - (int)((millis() - t0) / 1000);
+      if (r != restant) {
+        restant = r;
+        texteInfo("Toucher une tuile  -  " + String(machine == M_IMP ? "imprimante" : "CNC") + " dans " + String(r) + " s", 220, 0xBDF7);
+      }
+      if (r <= 0) choix = machine;
+    } else if (restant != 0) { restant = 0; texteInfo("Toucher la machine a piloter", 220, 0xBDF7); }
+    if (ecran.getTouch(&x, &y)) {
+      if (dedans(tuileCnc, x, y)) choix = M_CNC;
+      else if (dedans(tuileImp, x, y)) choix = M_IMP;
+    }
+    gererMaj();                                     // mises à jour Wi-Fi possibles pendant l'attente
+    delay(20);
+  }
+  dessinerTuile(choix == M_IMP ? tuileImp : tuileCnc, choix == M_IMP, true);
+  changerMachine(choix);
+  t = millis();
+  while (ecran.getTouch(&x, &y) && millis() - t < 3000) delay(20);
+  delay(150);
+  ecranActif = E_PRINCIPAL;
+  aRedessiner = true;
 }
 
 // ---------- Touches dans les menus ----------
 void toucheMenus(int x, int y) {
   if (ecranActif == E_MENU) {
     if (dedans(bmRetour, x, y))       fermerMenu();
-    else if (dedans(bmMachine, x, y)) changerMachine(machine == M_CNC ? M_IMP : M_CNC);
+    else if (dedans(bmMachine, x, y)) { choisirMachine(false); fermerMenu(); }
     else if (dedans(bmWifi, x, y))    scannerWifi();
     else if (dedans(bmIp, x, y))      { ecranActif = E_IP; saisie = (machine == M_IMP) ? impIp : cncIp; dessinerPave(); }
     else if (dedans(bmCherche, x, y)) chercherCnc();
@@ -1746,10 +1824,10 @@ void setup() {
   ecran.setFont(&fonts::FreeSansBold18pt7b);
   ecran.setTextColor(TFT_ORANGE);
   ecran.setTextDatum(textdatum_t::middle_center);
-  ecran.drawString(machine == M_IMP ? "K2" : "TTC450", 160, 100);
+  ecran.drawString("TELECOMMANDE", 160, 100);
   ecran.setFont(&fonts::FreeSans9pt7b);
   ecran.setTextColor(TFT_WHITE);
-  ecran.drawString(machine == M_IMP ? "Telecommande imprimante 3D" : "Telecommande CNC", 160, 140);
+  ecran.drawString("CNC  -  Imprimante 3D", 160, 140);
 
   // Réglages mémorisés (sinon valeurs du haut du programme)
   wifiNom = memoire.getString("ssid", WIFI_NOM);
@@ -1767,7 +1845,11 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.begin(wifiNom.c_str(), wifiMdp.c_str());
-  delay(1200);
+  delay(600);
+
+  // Écran de choix : CNC ou imprimante 3D (lancement auto de la dernière utilisée après 8 s ;
+  // au tout premier démarrage, on attend que la personne choisisse)
+  choisirMachine(memoire.isKey("mach"));
   aRedessiner = true;
 
   // Premier démarrage sans Wi-Fi réglé : on propose tout de suite la liste des réseaux
