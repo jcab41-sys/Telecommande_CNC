@@ -103,6 +103,9 @@ const char* MDP_MAJ = "ttc450";      // mot de passe des mises à jour par Wi-Fi
 // #define ECRAN_ST7789              // décommenter si l'écran est un ST7789
 // ==========================================================
 
+// Pile plus grande pour la tâche principale (requêtes HTTP vers l'imprimante)
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 // Zone tactile à l'écran (déclarée ici, avant toute fonction, pour l'IDE Arduino)
 struct BoutonEcran { int x, y, w, h; };
 
@@ -389,17 +392,26 @@ String encoderUrl(const String& t) {
 }
 
 // requête HTTP vers Moonraker ; renvoie le texte de la réponse, code = code HTTP (ou < 0)
+// Client réseau et client HTTP déclarés ensemble et une seule fois (globaux) :
+// le client HTTP ne doit jamais survivre au client réseau qu'il utilise.
+WiFiClient clientImp;
+HTTPClient httpImp;
+
 String requeteImp(const String& chemin, bool post, int delaiMs, int& code) {
-  HTTPClient h;
-  WiFiClient c;
   code = -1;
   if (WiFi.status() != WL_CONNECTED) return "";
-  if (!h.begin(c, "http://" + impIp + ":" + String(IMP_PORT) + chemin)) return "";
-  h.setConnectTimeout(delaiMs);
-  h.setTimeout(delaiMs);
-  code = post ? h.POST("") : h.GET();
-  String rep = code > 0 ? h.getString() : "";
-  h.end();
+  httpImp.setReuse(false);
+  if (!httpImp.begin(clientImp, "http://" + impIp + ":" + String(IMP_PORT) + chemin)) return "";
+  httpImp.setConnectTimeout(delaiMs);
+  httpImp.setTimeout(delaiMs);
+  code = post ? httpImp.POST("") : httpImp.GET();
+  String rep = "";
+  if (code > 0) {
+    int taille = httpImp.getSize();
+    if (taille < 0 || taille < 4000) rep = httpImp.getString();   // réponses courtes seulement
+  }
+  httpImp.end();
+  clientImp.stop();
   return rep;
 }
 
