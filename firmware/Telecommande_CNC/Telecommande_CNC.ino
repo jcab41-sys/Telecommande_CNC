@@ -103,11 +103,12 @@ const char* MDP_MAJ = "ttc450";      // mot de passe des mises à jour par Wi-Fi
 // #define ECRAN_ST7789              // décommenter si l'écran est un ST7789
 // ==========================================================
 
-// Pile plus grande pour la tâche principale (requêtes HTTP vers l'imprimante)
-SET_LOOP_TASK_STACK_SIZE(16 * 1024);
-
 // Zone tactile à l'écran (déclarée ici, avant toute fonction, pour l'IDE Arduino)
 struct BoutonEcran { int x, y, w, h; };
+
+// Pile plus grande pour la tâche principale (requêtes HTTP vers l'imprimante).
+// Placée APRÈS la structure ci-dessus : l'IDE Arduino insère ses déclarations avant la 1re fonction.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // ---- Broches ----
 #define PIN_JOY_X    1
