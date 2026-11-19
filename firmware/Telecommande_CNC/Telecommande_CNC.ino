@@ -37,7 +37,9 @@
    SONDE Z : palpage automatique avec la plaque de touche de la TTC450.
 
    AU DÉMARRAGE : 2 tuiles, CNC ou IMPRIMANTE 3D (la dernière utilisée démarre seule après 8 s).
-   Pour changer ensuite : MENU > bouton du haut "changer de machine".
+   Pour changer ensuite : toucher la petite icône à 2 tuiles en haut à gauche de l'écran
+   (ou MENU > bouton du haut "changer de machine").
+   Imprimante : MENU > CONNEXION IMPRIM. = adresse IP, port (7125 par défaut), clé API, test.
    MODE IMPRIMANTE 3D (Creality K2, Klipper) :
    Joysticks = déplacements de la tête et du plateau (bloqués pendant une impression),
    ORIGINE = G28, CHAUFFE PLA / STOP CHAUFFE, ANNULER IMP., MOTEURS OFF / REDEMARRER,
@@ -92,7 +94,7 @@ const float SONDE_DEGAGEMENT = 5.0;  // remontée après la mesure (mm)
 
 // ---- Imprimante 3D Creality K2 (Klipper / Moonraker) ----
 const char* IMP_IP = "192.168.1.128";  // adresse IP de la K2 (modifiable dans le MENU)
-const uint16_t IMP_PORT = 7125;        // port Moonraker
+const uint16_t IMP_PORT = 7125;        // port Moonraker par défaut (modifiable dans le MENU)
 const float IMP_VIT_XY_RAPIDE = 3000;  // mm/min
 const float IMP_VIT_XY_LENTE  = 600;
 const float IMP_VIT_Z_RAPIDE  = 600;
@@ -188,7 +190,10 @@ String klippyEtat = "?";             // ready / shutdown / error / startup
 String impAxes = "";                 // axes ayant fait leur origine ("xyz")
 float tBuse = 0, cBuse = 0, tPlat = 0, cPlat = 0, progression = 0;
 int vitImp = 100;                    // vitesse d'impression (%)
-enum { E_PRINCIPAL, E_MENU, E_WIFI, E_CLAVIER, E_IP };
+uint16_t impPort = IMP_PORT;         // port de Moonraker (7125, parfois 80 ou 4408)
+String impCle = "";                  // clé API Moonraker (vide si l'imprimante n'en demande pas)
+int modeSaisie = 0;                  // pavé / clavier : 0 = IP ou Wi-Fi, 1 = port, 2 = clé API
+enum { E_PRINCIPAL, E_MENU, E_WIFI, E_CLAVIER, E_IP, E_CONNEXION };
 int ecranActif = E_PRINCIPAL;
 
 // Couleurs
@@ -405,7 +410,8 @@ String requeteImp(const String& chemin, bool post, int delaiMs, int& code) {
   code = -1;
   if (WiFi.status() != WL_CONNECTED) return "";
   httpImp.setReuse(false);
-  if (!httpImp.begin(clientImp, "http://" + impIp + ":" + String(IMP_PORT) + chemin)) return "";
+  if (!httpImp.begin(clientImp, "http://" + impIp + ":" + String(impPort) + chemin)) return "";
+  if (impCle.length()) httpImp.addHeader("X-Api-Key", impCle);
   httpImp.setConnectTimeout(delaiMs);
   httpImp.setTimeout(delaiMs);
   code = post ? httpImp.POST("") : httpImp.GET();
@@ -819,8 +825,13 @@ void majEcran() {
     ecran.setFont(&fonts::FreeSansBold9pt7b);
     ecran.setTextColor(TFT_WHITE);
     ecran.setTextDatum(textdatum_t::middle_left);
-    ecran.setClipRect(0, 0, 214, 26);              // le texte ne déborde pas sur la batterie
-    ecran.drawString(msg ? message : txt, 6, 13);
+    // petite icône "2 tuiles" à gauche : la toucher ramène au choix de la machine
+    ecran.drawRoundRect(5, 6, 11, 14, 2, TFT_WHITE);
+    ecran.drawRoundRect(19, 6, 11, 14, 2, TFT_WHITE);
+    ecran.fillRoundRect(machine == M_IMP ? 20 : 6, 7, 9, 12, 2, TFT_WHITE);
+    ecran.drawFastVLine(36, 4, 18, 0xBDF7);
+    ecran.setClipRect(40, 0, 174, 26);             // le texte ne déborde pas sur la batterie
+    ecran.drawString(msg ? message : txt, 42, 13);
     ecran.clearClipRect();
     ecran.setTextDatum(textdatum_t::middle_right);
     ecran.drawString("MENU", 314, 13);
@@ -913,7 +924,11 @@ void gererTactile() {
   bool touche = ecran.getTouch(&x, &y);
   if (touche && !touchePrec) {
     if (ecranActif != E_PRINCIPAL) { toucheMenus(x, y); touchePrec = touche; return; }
-    if (confirmation < 0 && y < 26) {                 // barre du haut -> MENU
+    if (confirmation < 0 && y < 26 && x < 40) {       // icône à gauche -> choix de la machine
+      choisirMachine(false);
+      touchePrec = true; return;
+    }
+    if (confirmation < 0 && y < 26) {                 // reste de la barre du haut -> MENU
       if (jogActif) { envoyerTempsReel(0x85); jogActif = false; }
       ouvrirMenu();
       touchePrec = touche; return;
@@ -981,7 +996,7 @@ void ouvrirMenu() {
   dessinerBouton(bmMachine, machine == M_IMP ? "REGLAGES IMPRIMANTE\nchanger de machine" : "REGLAGES CNC\nchanger de machine",
                  machine == M_IMP ? 0x0010 : 0x0300);
   dessinerBouton(bmWifi, "CHOISIR\nWI-FI", 0x0410);
-  dessinerBouton(bmIp, machine == M_IMP ? "IP DE\nL'IMPRIM." : "IP DE\nLA CNC", C_BOUTON);
+  dessinerBouton(bmIp, machine == M_IMP ? "CONNEXION\nIMPRIM." : "IP DE\nLA CNC", C_BOUTON);
   dessinerBouton(bmCherche, machine == M_IMP ? "CHERCHER\nL'IMPRIM." : "CHERCHER\nLA CNC", 0x8A22);
   dessinerBouton(bmCalib, "CALIBRER\nECRAN", C_BOUTON);
   dessinerBouton(bmJoy, "SENS\nJOYSTICKS", 0x0410);
@@ -999,7 +1014,7 @@ void majMenu() {            // infos rafraîchies pendant que le menu est ouvert
   String l1 = "Wi-Fi : " + wifiNom + (w ? "  (connecte)" : "  (non connecte)");
   String l2 = "IP telecommande : " + (w ? WiFi.localIP().toString() : String("-"));
   bool okM = machine == M_IMP ? impOk : (cncAReponduConnexion && cnc.connected());
-  String l3 = machine == M_IMP ? "IP imprimante : " + impIp + ":" + String(IMP_PORT)
+  String l3 = machine == M_IMP ? "IP imprimante : " + impIp + ":" + String(impPort)
                                : "IP CNC : " + cncIp + ":" + String(cncPort);
   l3 += okM ? "  (OK)" : "  (introuvable)";
   String l4 = (w ? "Wi-Fi " + String(WiFi.RSSI()) + " dBm" : String("Wi-Fi -"))
@@ -1122,7 +1137,7 @@ void dessinerClavier() {
   ecran.setFont(&fonts::FreeSans9pt7b);
   ecran.setTextColor(TFT_WHITE, C_TITRE);
   ecran.setTextDatum(textdatum_t::middle_center);
-  String t = "Mot de passe : " + reseauChoisi;
+  String t = modeSaisie == 2 ? String("Cle API Moonraker") : "Mot de passe : " + reseauChoisi;
   if (t.length() > 26) t = t.substring(0, 25) + ".";
   ecran.drawString(t, 212, 19);
   dessinerSaisie();
@@ -1179,7 +1194,7 @@ void dessinerPave() {
   ecran.setFont(&fonts::FreeSansBold9pt7b);
   ecran.setTextColor(TFT_WHITE, C_TITRE);
   ecran.setTextDatum(textdatum_t::middle_center);
-  ecran.drawString(machine == M_IMP ? "IP DE L'IMPRIMANTE" : "IP DE LA CNC", 212, 19);
+  ecran.drawString(modeSaisie == 1 ? "PORT (7125 par defaut)" : machine == M_IMP ? "IP DE L'IMPRIMANTE" : "IP DE LA CNC", 212, 19);
   dessinerSaisie();
   for (int r = 0; r < 3; r++)
     for (int c = 0; c < 4; c++)
@@ -1277,7 +1292,7 @@ void chercherImprimante() {
   IPAddress moi = WiFi.localIP();
   titreEcran("RECHERCHE IMPRIMANTE");
   texteInfo("Toucher l'ecran pour arreter", 210, 0xBDF7);
-  portsScan[0] = IMP_PORT; nbPortsScan = 1;
+  portsScan[0] = impPort; nbPortsScan = 1;
   nbCandidats = 0;
   bool arret = false;
   for (int h = 1; h < 255 && !arret; h += 8) {
@@ -1297,7 +1312,7 @@ void chercherImprimante() {
     if (estUneImprimante(ip)) { impIp = ip.toString(); memoire.putString("ipImp", impIp); trouve = true; }
   }
   if (trouve) texteInfo("Imprimante trouvee : " + impIp, 175, TFT_GREENYELLOW);
-  else texteInfo("Aucune imprimante Klipper (port 7125)", 175, TFT_ORANGE);
+  else texteInfo("Aucune imprimante Klipper (port " + String(impPort) + ")", 175, TFT_ORANGE);
   delay(2500);
   impOk = false; tImpPoll = 0;
   ouvrirMenu();
@@ -1473,6 +1488,50 @@ void testCablage() {
   }
 }
 
+// ---------- Réglages de connexion de l'imprimante : IP, port, clé API ----------
+const BoutonEcran bcIp      = {4, 150, 102, 40};
+const BoutonEcran bcPort    = {109, 150, 102, 40};
+const BoutonEcran bcCle     = {214, 150, 102, 40};
+const BoutonEcran bcDefaut  = {4, 196, 102, 40};
+const BoutonEcran bcSansCle = {109, 196, 102, 40};
+const BoutonEcran bcTester  = {214, 196, 102, 40};
+
+String cleMasquee() {
+  if (impCle.length() == 0) return "aucune";
+  if (impCle.length() <= 4) return "****";
+  return "****" + impCle.substring(impCle.length() - 4);
+}
+
+void ouvrirConnexionImp() {
+  ecranActif = E_CONNEXION;
+  titreEcran("CONNEXION IMPRIMANTE");
+  texteInfo("Adresse IP : " + impIp, 56, TFT_WHITE);
+  texteInfo("Port : " + String(impPort) + (impPort == IMP_PORT ? "  (normal)" : ""), 80, TFT_WHITE);
+  texteInfo("Cle API : " + cleMasquee(), 104, TFT_WHITE);
+  texteInfo(impOk ? "Etat : imprimante OK" : "Etat : pas de reponse", 128, impOk ? TFT_GREENYELLOW : TFT_ORANGE);
+  dessinerBouton(bcIp, "ADRESSE\nIP", C_BOUTON);
+  dessinerBouton(bcPort, "PORT", C_BOUTON);
+  dessinerBouton(bcCle, "CLE\nAPI", C_BOUTON);
+  dessinerBouton(bcDefaut, "PORT\n7125", 0x4208);
+  dessinerBouton(bcSansCle, "SANS\nCLE", 0x4208);
+  dessinerBouton(bcTester, "TESTER", 0x0400);
+}
+
+void testerConnexionImp() {
+  texteInfo("Test en cours...", 128, TFT_WHITE);
+  int code;
+  String rep = requeteImp("/server/info", false, 2500, code);
+  if (code == 200 && rep.indexOf("klippy") >= 0) {
+    String etat = valeurJson(rep, "klippy_state", 0);
+    texteInfo("OK : Klipper " + etat, 128, TFT_GREENYELLOW);
+    impOk = false; tImpPoll = 0;
+  }
+  else if (code == 401 || code == 403) texteInfo("Refuse : cle API manquante ou fausse", 128, TFT_ORANGE);
+  else if (code == 404)                texteInfo("Repond, mais pas Moonraker (port ?)", 128, TFT_ORANGE);
+  else if (code > 0)                   texteInfo("Reponse inattendue (code " + String(code) + ")", 128, TFT_ORANGE);
+  else                                 texteInfo("Pas de reponse : IP ou port ?", 128, TFT_ORANGE);
+}
+
 // ---------- Changement de machine (CNC <-> imprimante 3D) ----------
 void changerMachine(int m) {
   if (m == machine) { memoire.putInt("mach", machine); return; }
@@ -1567,7 +1626,7 @@ void toucheMenus(int x, int y) {
     if (dedans(bmRetour, x, y))       fermerMenu();
     else if (dedans(bmMachine, x, y)) { choisirMachine(false); fermerMenu(); }
     else if (dedans(bmWifi, x, y))    scannerWifi();
-    else if (dedans(bmIp, x, y))      { ecranActif = E_IP; saisie = (machine == M_IMP) ? impIp : cncIp; dessinerPave(); }
+    else if (dedans(bmIp, x, y))      { if (machine == M_IMP) ouvrirConnexionImp(); else { modeSaisie = 0; ecranActif = E_IP; saisie = cncIp; dessinerPave(); } }
     else if (dedans(bmCherche, x, y)) chercherCnc();
     else if (dedans(bmCalib, x, y))   { calibrerTactile(); ouvrirMenu(); }
     else if (dedans(bmJoy, x, y))     { reglerSensJoysticks(); ouvrirMenu(); }
@@ -1582,6 +1641,7 @@ void toucheMenus(int x, int y) {
       int i = pageWifi * LIGNES_WIFI + k;
       if (i < nbReseaux && dedans(ligneWifi(k), x, y)) {
         reseauChoisi = reseaux[i];
+        modeSaisie = 0;
         if (reseauProtege[i]) ouvrirClavier(reseauChoisi == wifiNom ? wifiMdp : String(""));
         else connecterWifi(reseauChoisi, "");
         return;
@@ -1589,8 +1649,12 @@ void toucheMenus(int x, int y) {
     }
   }
   else if (ecranActif == E_CLAVIER) {
-    if (dedans(bkAnnuler, x, y)) { ouvrirMenu(); return; }
-    if (dedans(bkOk, x, y))      { connecterWifi(reseauChoisi, saisie); return; }
+    if (dedans(bkAnnuler, x, y)) { if (modeSaisie == 2) ouvrirConnexionImp(); else ouvrirMenu(); return; }
+    if (dedans(bkOk, x, y)) {
+      if (modeSaisie == 2) { impCle = saisie; impCle.trim(); memoire.putString("cleImp", impCle); impOk = false; tImpPoll = 0; ouvrirConnexionImp(); }
+      else connecterWifi(reseauChoisi, saisie);
+      return;
+    }
     if (dedans(bkEff, x, y))     { if (saisie.length()) saisie.remove(saisie.length() - 1); dessinerSaisie(); return; }
     if (dedans(bkEsp, x, y))     { saisie += ' '; dessinerSaisie(); return; }
     if (dedans(bkMaj, x, y))     { modeClavier = (modeClavier == 1) ? 0 : 1; dessinerClavier(); return; }
@@ -1601,16 +1665,33 @@ void toucheMenus(int x, int y) {
         if (dedans(toucheClavier(r, k), x, y)) { saisie += lettres[k]; dessinerSaisie(); return; }
     }
   }
+  else if (ecranActif == E_CONNEXION) {
+    if (dedans(bmRetour, x, y))   { ouvrirMenu(); return; }
+    if (dedans(bcIp, x, y))       { modeSaisie = 0; ecranActif = E_IP; saisie = impIp; dessinerPave(); return; }
+    if (dedans(bcPort, x, y))     { modeSaisie = 1; ecranActif = E_IP; saisie = String(impPort); dessinerPave(); return; }
+    if (dedans(bcCle, x, y))      { modeSaisie = 2; reseauChoisi = ""; ouvrirClavier(impCle); return; }
+    if (dedans(bcDefaut, x, y))   { impPort = IMP_PORT; memoire.putUShort("portImp", impPort); impOk = false; tImpPoll = 0; ouvrirConnexionImp(); return; }
+    if (dedans(bcSansCle, x, y))  { impCle = ""; memoire.putString("cleImp", impCle); impOk = false; tImpPoll = 0; ouvrirConnexionImp(); return; }
+    if (dedans(bcTester, x, y))   { testerConnexionImp(); return; }
+  }
   else if (ecranActif == E_IP) {
-    if (dedans(bkAnnuler, x, y)) { ouvrirMenu(); return; }
+    bool imp = (machine == M_IMP);
+    if (dedans(bkAnnuler, x, y)) { if (imp) ouvrirConnexionImp(); else ouvrirMenu(); return; }
     if (dedans(bpEff, x, y))     { saisie = ""; dessinerSaisie(); return; }
     if (dedans(bpOk, x, y)) {
       IPAddress ip;
-      if (ip.fromString(saisie) && machine == M_IMP) {
+      if (modeSaisie == 1) {                          // port
+        long pt = saisie.toInt();
+        if (pt >= 1 && pt <= 65535 && saisie.indexOf('.') < 0) {
+          impPort = (uint16_t)pt; memoire.putUShort("portImp", impPort);
+          impOk = false; tImpPoll = 0;
+          ouvrirConnexionImp();
+        } else texteInfo("Port invalide (ex : 7125)", 61, TFT_ORANGE);
+      } else if (ip.fromString(saisie) && imp) {
         impIp = ip.toString();
         memoire.putString("ipImp", impIp);
         impOk = false; tImpPoll = 0;
-        ouvrirMenu();
+        ouvrirConnexionImp();
       } else if (ip.fromString(saisie)) {
         cncIp = ip.toString();
         memoire.putString("ip", cncIp);
@@ -1846,6 +1927,8 @@ void setup() {
   sgnZ = memoire.getInt("sgnZ", 1);
   machine = memoire.getInt("mach", M_CNC);
   impIp   = memoire.getString("ipImp", IMP_IP);
+  impPort = memoire.getUShort("portImp", IMP_PORT);
+  impCle  = memoire.getString("cleImp", "");
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);

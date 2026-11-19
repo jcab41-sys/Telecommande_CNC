@@ -14,8 +14,8 @@ Conçue pour la **TwoTrees TTC450** (carte **MKS DLC32**), elle marche avec tout
 - Batterie 18650 rechargeable en USB-C, voyant qui « respire » pendant la charge, niveau de batterie à l'écran.
 - Mises à jour par le Wi-Fi (ArduinoOTA).
 - Support mural : la télécommande reste en charge quand elle est accrochée.
-- **Au démarrage, 2 tuiles : CNC ou IMPRIMANTE 3D** (la dernière utilisée démarre seule après 8 s). Chaque machine a ses propres réglages ; on change ensuite par MENU → « changer de machine ».
-- **Mode imprimante 3D** (Creality K2 / Klipper, via Moonraker port 7125) : Déplacements tête/plateau (bloqués pendant une impression), origine G28, préchauffe PLA, pause / reprise, annulation, arrêt d'urgence, vitesse d'impression au potentiomètre, températures et progression à l'écran.
+- **Au démarrage, 2 tuiles : CNC ou IMPRIMANTE 3D** (la dernière utilisée démarre seule après 8 s). Chaque machine a ses propres réglages ; on change à tout moment en touchant la petite icône à 2 tuiles en haut à gauche de l'écran.
+- **Mode imprimante 3D** (Creality K2 et autres imprimantes Klipper / Moonraker ; IP, port et clé API réglables dans MENU → CONNEXION IMPRIM.) : Déplacements tête/plateau (bloqués pendant une impression), origine G28, préchauffe PLA, pause / reprise, annulation, arrêt d'urgence, vitesse d'impression au potentiomètre, températures et progression à l'écran.
 
 ## Contenu du dépôt
 | Dossier | Contenu |
