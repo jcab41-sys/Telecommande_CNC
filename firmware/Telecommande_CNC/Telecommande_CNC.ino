@@ -95,6 +95,7 @@ const float IMP_VIT_XY_RAPIDE = 3000;  // mm/min
 const float IMP_VIT_XY_LENTE  = 600;
 const float IMP_VIT_Z_RAPIDE  = 600;
 const float IMP_VIT_Z_LENTE   = 120;
+const int   IMP_SENS_Z = -1;         // -1 = Z inversé par rapport à la CNC (plateau de la K2) ; mettre 1 pour revenir
 const int   CHAUFFE_BUSE    = 210;     // préchauffe PLA (°C)
 const int   CHAUFFE_PLATEAU = 60;
 
@@ -585,6 +586,7 @@ void gererJog() {
 
 // Déplacements de l'imprimante : petits mouvements relatifs G1 envoyés tant qu'on pousse
 void jogImprimante(float nx, float ny, float nz) {
+  nz = nz * IMP_SENS_Z;                          // sens du Z propre à l'imprimante
   float vXY = rapide ? IMP_VIT_XY_RAPIDE : IMP_VIT_XY_LENTE;
   float vZ  = rapide ? IMP_VIT_Z_RAPIDE  : IMP_VIT_Z_LENTE;
   if (PAS[modePas] == 0) {                       // continu
