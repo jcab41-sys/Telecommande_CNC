@@ -41,7 +41,7 @@
    MODE IMPRIMANTE 3D (Creality K2, Klipper) :
    Joysticks = déplacements de la tête et du plateau (bloqués pendant une impression),
    ORIGINE = G28, CHAUFFE PLA / STOP CHAUFFE, ANNULER IMP., MOTEURS OFF / REDEMARRER,
-   PAUSE = pause / reprise de l'impression, ARRÊT = arrêt d'urgence Klipper,
+   ZÉRO XY maintenu 1 s = ORIGINE (G28), PAUSE = pause / reprise de l'impression, ARRÊT = arrêt d'urgence Klipper,
    potentiomètre = vitesse d'impression (%).
 
    Calibrage du tactile : se fait tout seul au premier démarrage.
@@ -1649,7 +1649,13 @@ void gererBoutons() {
       else if (impEtat == "printing") { if (actionImp("/printer/print/pause"))  afficherMessage("Pause"); }
       else afficherMessage("Pas d'impression en cours");
     }
-    if (bZeroXY.appuye || bZeroZ.appuye) afficherMessage("Sans effet sur l'imprimante");
+    // ZÉRO XY maintenu 1 s = retour à l'origine (G28), comme le bouton ORIGINE de l'écran
+    if (bZeroXY.maintenu()) afficherMessage("Maintenir 1 s : ORIGINE");
+    if (bZeroXY.appuiLong) {
+      if (impEnImpression()) afficherMessage("Impression en cours");
+      else if (impOk && klippyEtat == "ready") { gcodeImp("G28", 400); afficherMessage("Origine en cours..."); }
+    }
+    if (bZeroZ.appuye) afficherMessage("Sans effet sur l'imprimante");
     return;
   }
   if (bArret.appuye) {
