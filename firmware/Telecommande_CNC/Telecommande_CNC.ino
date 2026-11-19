@@ -36,6 +36,12 @@
    automatiquement sur le réseau, recalibrer l'écran. Tout est mémorisé.
    SONDE Z : palpage automatique avec la plaque de touche de la TTC450.
 
+   MODE IMPRIMANTE 3D (Creality K2, Klipper) : MENU > bouton du haut "MACHINE".
+   Joysticks = déplacements de la tête et du plateau (bloqués pendant une impression),
+   ORIGINE = G28, CHAUFFE PLA / STOP CHAUFFE, ANNULER IMP., MOTEURS OFF / REDEMARRER,
+   PAUSE = pause / reprise de l'impression, ARRÊT = arrêt d'urgence Klipper,
+   potentiomètre = vitesse d'impression (%).
+
    Calibrage du tactile : se fait tout seul au premier démarrage.
    Pour le refaire : maintenir PAUSE en allumant la télécommande.
 
@@ -55,6 +61,7 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ArduinoOTA.h>
+#include <HTTPClient.h>
 #include <lwip/sockets.h>
 #include <LovyanGFX.hpp>
 #include "soc/rtc_cntl_reg.h"
@@ -80,6 +87,16 @@ const float SONDE_COURSE    = 30.0;  // descente maximale pendant la recherche (
 const float SONDE_VIT_RAPIDE = 100;  // 1re touche (mm/min)
 const float SONDE_VIT_LENTE  = 25;   // 2e touche, précise (mm/min)
 const float SONDE_DEGAGEMENT = 5.0;  // remontée après la mesure (mm)
+
+// ---- Imprimante 3D Creality K2 (Klipper / Moonraker) ----
+const char* IMP_IP = "192.168.1.128";  // adresse IP de la K2 (modifiable dans le MENU)
+const uint16_t IMP_PORT = 7125;        // port Moonraker
+const float IMP_VIT_XY_RAPIDE = 3000;  // mm/min
+const float IMP_VIT_XY_LENTE  = 600;
+const float IMP_VIT_Z_RAPIDE  = 600;
+const float IMP_VIT_Z_LENTE   = 120;
+const int   CHAUFFE_BUSE    = 210;     // préchauffe PLA (°C)
+const int   CHAUFFE_PLATEAU = 60;
 
 const bool UTILISER_POT = true;      // false si le potentiomètre n'est pas câblé
 const char* MDP_MAJ = "ttc450";      // mot de passe des mises à jour par Wi-Fi
@@ -154,6 +171,16 @@ int srcX = 0, sgnX = 1, sgnY = 1, sgnZ = 1;   // orientation des joysticks (MENU
 bool cncAReponduConnexion = false;   // la CNC a-t-elle répondu depuis la connexion ?
 float battVolts = 0;                 // tension batterie filtrée
 int   battPct = -1;                  // niveau batterie en % (-1 = pas encore mesuré)
+// ---- Machine pilotée : CNC (GRBL) ou imprimante 3D (Klipper) ----
+enum { M_CNC, M_IMP };
+int machine = M_CNC;
+String impIp;
+bool impOk = false;                  // l'imprimante répond ?
+String impEtat = "?";                // standby / printing / paused / complete / cancelled / error
+String klippyEtat = "?";             // ready / shutdown / error / startup
+String impAxes = "";                 // axes ayant fait leur origine ("xyz")
+float tBuse = 0, cBuse = 0, tPlat = 0, cPlat = 0, progression = 0;
+int vitImp = 100;                    // vitesse d'impression (%)
 enum { E_PRINCIPAL, E_MENU, E_WIFI, E_CLAVIER, E_IP };
 int ecranActif = E_PRINCIPAL;
 
@@ -346,6 +373,120 @@ void gererConnexion() {
 }
 
 // ============================================================
+//  Imprimante 3D (Creality K2 : Klipper + Moonraker en HTTP)
+// ============================================================
+unsigned long tImpPoll = 0, tImpEnvoi = 0;
+
+String encoderUrl(const String& t) {
+  const char* hex = "0123456789ABCDEF";
+  String o = "";
+  for (unsigned int i = 0; i < t.length(); i++) {
+    char ch = t[i];
+    if (isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == '.') o += ch;
+    else { o += '%'; o += hex[(ch >> 4) & 15]; o += hex[ch & 15]; }
+  }
+  return o;
+}
+
+// requête HTTP vers Moonraker ; renvoie le texte de la réponse, code = code HTTP (ou < 0)
+String requeteImp(const String& chemin, bool post, int delaiMs, int& code) {
+  HTTPClient h;
+  WiFiClient c;
+  code = -1;
+  if (WiFi.status() != WL_CONNECTED) return "";
+  if (!h.begin(c, "http://" + impIp + ":" + String(IMP_PORT) + chemin)) return "";
+  h.setConnectTimeout(delaiMs);
+  h.setTimeout(delaiMs);
+  code = post ? h.POST("") : h.GET();
+  String rep = code > 0 ? h.getString() : "";
+  h.end();
+  return rep;
+}
+
+// valeur d'une clé dans un texte JSON simple (nombre ou texte)
+String valeurJson(const String& s, const String& cle, int depuis) {
+  int i = s.indexOf("\"" + cle + "\"", depuis);
+  if (i < 0) return "";
+  i = s.indexOf(':', i);
+  if (i < 0) return "";
+  i++;
+  while (i < (int)s.length() && s[i] == ' ') i++;
+  if (i < (int)s.length() && s[i] == '"') {
+    int f = s.indexOf('"', i + 1);
+    return f > 0 ? s.substring(i + 1, f) : "";
+  }
+  int f = i;
+  while (f < (int)s.length() && s[f] != ',' && s[f] != '}' && s[f] != ']') f++;
+  return s.substring(i, f);
+}
+
+void messageErreurImp(const String& rep) {
+  String m = valeurJson(rep, "message", 0);
+  m.replace("\\n", " ");
+  if (m.indexOf("home") >= 0 || m.indexOf("Must home") >= 0) m = "Faire ORIGINE d'abord";
+  else if (m.indexOf("out of range") >= 0) m = "Hors limites";
+  if (m.length() > 30) m = m.substring(0, 30);
+  afficherMessage(m.length() ? m : String("Refuse par l'imprimante"));
+}
+
+// envoie du G-code ; délai court pour les commandes longues (G28...) : elles continuent quand même
+bool gcodeImp(const String& script, int delaiMs) {
+  int code;
+  String rep = requeteImp("/printer/gcode/script?script=" + encoderUrl(script), true, delaiMs, code);
+  tImpEnvoi = millis();
+  if (code >= 400) { messageErreurImp(rep); return false; }
+  return true;
+}
+
+bool actionImp(const String& chemin) {
+  int code;
+  String rep = requeteImp(chemin, true, 2000, code);
+  if (code >= 400) { messageErreurImp(rep); return false; }
+  return code > 0;
+}
+
+void interrogerImp() {
+  int code;
+  String rep = requeteImp("/printer/objects/query?print_stats=state&toolhead=position,homed_axes"
+                          "&extruder=temperature,target&heater_bed=temperature,target"
+                          "&virtual_sdcard=progress&gcode_move=speed_factor", false, 800, code);
+  if (code <= 0) { impOk = false; return; }
+  impOk = true;
+  if (code != 200) {                               // Klipper arrêté (après ARRÊT ou erreur)
+    klippyEtat = (rep.indexOf("shutdown") >= 0) ? "shutdown" : "error";
+    return;
+  }
+  klippyEtat = "ready";
+  impEtat = valeurJson(rep, "state", rep.indexOf("\"print_stats\""));
+  impAxes = valeurJson(rep, "homed_axes", 0);
+  int i = rep.indexOf("\"position\"");
+  if (i >= 0) {
+    i = rep.indexOf('[', i);
+    if (i >= 0) sscanf(rep.c_str() + i + 1, "%f, %f, %f", &pos[0], &pos[1], &pos[2]);
+  }
+  int e = rep.indexOf("\"extruder\""), b = rep.indexOf("\"heater_bed\"");
+  if (e >= 0) { tBuse = valeurJson(rep, "temperature", e).toFloat(); cBuse = valeurJson(rep, "target", e).toFloat(); }
+  if (b >= 0) { tPlat = valeurJson(rep, "temperature", b).toFloat(); cPlat = valeurJson(rep, "target", b).toFloat(); }
+  progression = valeurJson(rep, "progress", 0).toFloat();
+  String sf = valeurJson(rep, "speed_factor", 0);
+  if (sf.length()) vitImp = (int)(sf.toFloat() * 100 + 0.5);
+}
+
+void gererImprimante() {
+  if (WiFi.status() != WL_CONNECTED) { impOk = false; return; }
+  unsigned long periode = impOk ? 500 : 3000;
+  if (millis() - tImpEnvoi < 400) return;          // on laisse passer les déplacements en cours
+  if (millis() - tImpPoll > periode) { tImpPoll = millis(); interrogerImp(); }
+}
+
+bool impEnImpression() { return impEtat == "printing" || impEtat == "paused"; }
+bool peutBougerImp() {
+  if (!impOk || klippyEtat != "ready") return false;
+  if (impEnImpression()) { afficherMessage("Impression en cours : bloque"); return false; }
+  return true;
+}
+
+// ============================================================
 //  Joysticks et potentiomètre
 // ============================================================
 // Recentrage automatique : quand un joystick reste immobile près du centre pendant
@@ -382,6 +523,7 @@ void gererJog() {
     nx = sgnX * (srcX == 0 ? bx : by);
     ny = sgnY * (srcX == 0 ? by : bx);
     nz = sgnZ * nz; }
+  if (machine == M_IMP) { jogImprimante(nx, ny, nz); return; }
   float vXY = rapide ? VIT_XY_RAPIDE : VIT_XY_LENTE;
   float vZ  = rapide ? VIT_Z_RAPIDE  : VIT_Z_LENTE;
 
@@ -428,6 +570,43 @@ void gererJog() {
   }
 }
 
+// Déplacements de l'imprimante : petits mouvements relatifs G1 envoyés tant qu'on pousse
+void jogImprimante(float nx, float ny, float nz) {
+  float vXY = rapide ? IMP_VIT_XY_RAPIDE : IMP_VIT_XY_LENTE;
+  float vZ  = rapide ? IMP_VIT_Z_RAPIDE  : IMP_VIT_Z_LENTE;
+  if (PAS[modePas] == 0) {                       // continu
+    if (nx == 0 && ny == 0 && nz == 0) return;
+    if (millis() - tJog < 180 || !peutBougerImp()) return;
+    tJog = millis();
+    const float dt = 0.2;
+    float vx = nx * vXY, vy = ny * vXY, vz = nz * vZ;
+    float f = sqrt(vx * vx + vy * vy + vz * vz);
+    if (f < 1) return;
+    String c = "G91\nG1";
+    if (nx != 0) c += " X" + nb(vx / 60.0 * dt);
+    if (ny != 0) c += " Y" + nb(vy / 60.0 * dt);
+    if (nz != 0) c += " Z" + nb(vz / 60.0 * dt);
+    gcodeImp(c + " F" + String((int)f) + "\nG90", 1000);
+    return;
+  }
+  float pas = PAS[modePas];                      // pas à pas
+  if (nx == 0 && ny == 0) xyAuRepos = true;
+  else if (xyAuRepos || millis() - tPasXY > 500) {
+    if (peutBougerImp()) {
+      String c = "G91\nG1 ";
+      if (fabs(nx) >= fabs(ny)) c += "X" + nb(nx > 0 ? pas : -pas);
+      else                      c += "Y" + nb(ny > 0 ? pas : -pas);
+      gcodeImp(c + " F" + String((int)vXY) + "\nG90", 1000);
+    }
+    tPasXY = millis(); xyAuRepos = false;
+  }
+  if (nz == 0) zAuRepos = true;
+  else if (zAuRepos || millis() - tPasZ > 500) {
+    if (peutBougerImp()) gcodeImp("G91\nG1 Z" + nb(nz > 0 ? pas : -pas) + " F" + String((int)vZ) + "\nG90", 1000);
+    tPasZ = millis(); zAuRepos = false;
+  }
+}
+
 // Potentiomètre : moitié gauche 10 -> 100 %, moitié droite 100 -> 200 %, zone 100 % au milieu
 int consignePot() {
   static int cons = 100;
@@ -447,6 +626,15 @@ int consignePot() {
 
 void gererAvance() {
   static unsigned long t = 0;
+  if (machine == M_IMP) {                          // imprimante : vitesse d'impression M220
+    static int envoye = -1;
+    if (!UTILISER_POT || !impOk || klippyEtat != "ready" || millis() - t < 300) return;
+    t = millis();
+    int c = consignePot();
+    if (envoye < 0) { envoye = c; if (c == vitImp) return; }
+    if (c != envoye) { if (gcodeImp("M220 S" + String(c), 800)) { envoye = c; vitImp = c; } }
+    return;
+  }
   if (!UTILISER_POT || !cnc.connected() || millis() - t < 60) return;
   t = millis();
   int diff = consignePot() - ovLocal;
@@ -473,6 +661,14 @@ bool aRedessiner = true;
 String cacheHaut = "", cacheBas = "", cacheVal[3] = {"", "", ""};
 
 String texteBouton(int i) {
+  if (machine == M_IMP) switch (i) {
+    case BE_PAS:       return String("PAS ") + NOM_PAS[modePas];
+    case BE_VIT:       return rapide ? "RAPIDE" : "LENT";
+    case BE_ORIGINE:   return "ORIGINE";
+    case BE_RETOUR:    return (cBuse > 0 || cPlat > 0) ? "STOP CHAUFFE" : "CHAUFFE PLA";
+    case BE_SONDE:     return "ANNULER IMP.";
+    default:           return (klippyEtat == "shutdown" || klippyEtat == "error") ? "REDEMARRER" : "MOTEURS OFF";
+  }
   switch (i) {
     case BE_PAS:       return String("PAS ") + NOM_PAS[modePas];
     case BE_VIT:       return rapide ? "RAPIDE" : "LENT";
@@ -483,6 +679,12 @@ String texteBouton(int i) {
   }
 }
 uint16_t couleurBouton(int i) {
+  if (machine == M_IMP) {
+    if (i == BE_RETOUR) return 0x8A22;
+    if (i == BE_SONDE) return 0x7800;
+    if (i == BE_DEBLOQUER) return (klippyEtat == "shutdown" || klippyEtat == "error") ? 0x7800 : C_BOUTON;
+    return C_BOUTON;
+  }
   if (i == BE_SONDE) return 0x8A22;      // orange foncé
   if (i == BE_DEBLOQUER) return 0x7800;  // rouge foncé
   return C_BOUTON;
@@ -510,6 +712,18 @@ void dessinerBouton(const BoutonEcran& b, const String& t, uint16_t coul) {
 }
 
 void couleursEtat(String& txt, uint16_t& coul) {
+  if (machine == M_IMP) {
+    coul = 0x4208; txt = impEtat;
+    if (klippyEtat == "shutdown")     { txt = "ARRETEE > REDEMARRER"; coul = 0xB000; }
+    else if (klippyEtat == "error")   { txt = "ERREUR IMPRIMANTE";    coul = 0xB000; }
+    else if (impEtat == "printing")   { txt = "IMPRESSION " + String((int)(progression * 100)) + "%"; coul = 0x001F; }
+    else if (impEtat == "paused")     { txt = "PAUSE";    coul = 0xC300; }
+    else if (impEtat == "complete")   { txt = "TERMINEE"; coul = 0x0400; }
+    else if (impEtat == "cancelled")  { txt = "ANNULEE";  coul = 0x0400; }
+    else if (impEtat == "error")      { txt = "ERREUR";   coul = 0xB000; }
+    else                              { txt = "PRETE";    coul = 0x0400; }
+    return;
+  }
   String e = etatGrbl;
   coul = 0x4208; txt = e;
   if (e == "Idle")       { txt = "PRET";        coul = 0x0400; }
@@ -545,7 +759,11 @@ void dessinerConfirmation() {
   ecran.setTextDatum(textdatum_t::middle_center);
   ecran.drawString(texteBouton(confirmation) + " ?", 160, 80);
   ecran.setFont(&fonts::FreeSans9pt7b);
-  if (confirmation == BE_SONDE) {
+  if (machine == M_IMP) {
+    if (confirmation == BE_ORIGINE)     ecran.drawString("Origine des 3 axes (G28)", 160, 115);
+    else if (confirmation == BE_RETOUR) ecran.drawString("Buse " + String(CHAUFFE_BUSE) + " C, plateau " + String(CHAUFFE_PLATEAU) + " C", 160, 115);
+    else                                ecran.drawString("L'impression sera perdue", 160, 115);
+  } else if (confirmation == BE_SONDE) {
     ecran.drawString("Plaque sous la fraise ?", 160, 108);
     ecran.drawString("Pince sur la fraise ?", 160, 128);
   } else if (confirmation == BE_ORIGINE) {
@@ -567,11 +785,17 @@ void majEcran() {
   // Barre d'état en haut
   String txt; uint16_t coul;
   if (WiFi.status() != WL_CONNECTED)  { txt = "Wi-Fi " + wifiNom + "..."; coul = 0x4208; }
-  else if (!cnc.connected())          { txt = "Recherche CNC " + cncIp; coul = 0x4208; }
+  else if (machine == M_IMP && !impOk) { txt = "Recherche imprim. " + impIp; coul = 0x4208; }
+  else if (machine == M_CNC && !cnc.connected()) { txt = "Recherche CNC " + cncIp; coul = 0x4208; }
   else couleursEtat(txt, coul);
   bool msg = message.length() && millis() - tMessage < 2500;
   lireBatterie();
   String haut = (msg ? message : txt) + "|" + String(coul) + "|" + String(battPct) + String(enCharge());
+  if (machine == M_IMP) {                         // libellés qui dépendent de l'état de l'imprimante
+    static String etiquettes = "";
+    String e = texteBouton(BE_RETOUR) + texteBouton(BE_DEBLOQUER);
+    if (e != etiquettes) { etiquettes = e; rafraichirBouton(BE_RETOUR); rafraichirBouton(BE_DEBLOQUER); }
+  }
   if (haut != cacheHaut) {
     cacheHaut = haut;
     ecran.fillRect(0, 0, 320, 26, msg ? 0x2124 : coul);
@@ -602,16 +826,26 @@ void majEcran() {
   ecran.setTextPadding(0);
 
   // Ligne du bas : avance
-  int cons = UTILISER_POT ? consignePot() : ovAvance;
-  String bas1 = "Avance " + String(ovAvance) + "%";               // 1re ligne
-  if (UTILISER_POT && cons != ovAvance) bas1 += " > " + String(cons) + "%";
-  String bas2 = (etatGrbl == "Run") ? String((int)vitesseAvance) + " mm/min" : "";   // 2e ligne
+  String bas1, bas2;
+  if (machine == M_IMP) {
+    bas1 = "Buse " + String((int)tBuse) + (cBuse > 0 ? "/" + String((int)cBuse) : String("")) + "  Plat. "
+         + String((int)tPlat) + (cPlat > 0 ? "/" + String((int)cPlat) : String(""));
+    bas2 = "Vitesse " + String(vitImp) + "%";
+    if (impEnImpression()) bas2 = String((int)(progression * 100)) + "%   " + bas2;
+    if (impAxes.length() < 3 && !impEnImpression()) bas2 += "  (pas d'origine)";
+  } else {
+    int cons = UTILISER_POT ? consignePot() : ovAvance;
+    bas1 = "Avance " + String(ovAvance) + "%";                     // 1re ligne
+    if (UTILISER_POT && cons != ovAvance) bas1 += " > " + String(cons) + "%";
+    bas2 = (etatGrbl == "Run") ? String((int)vitesseAvance) + " mm/min" : "";   // 2e ligne
+  }
   if (bas1 + bas2 != cacheBas) {
     cacheBas = bas1 + bas2;
     ecran.fillRect(0, 194, 196, 46, C_FOND);
     ecran.setFont(&fonts::FreeSans9pt7b);
     ecran.setTextColor(0xBDF7, C_FOND);
     ecran.setTextDatum(textdatum_t::middle_left);
+    if (ecran.textWidth(bas1) > 188 || ecran.textWidth(bas2) > 188) ecran.setFont(&fonts::Font2);
     ecran.drawString(bas1, 6, 206);
     ecran.drawString(bas2, 6, 228);
   }
@@ -627,6 +861,18 @@ bool dedans(const BoutonEcran& b, int x, int y) {
 }
 
 void executer(int i) {
+  if (machine == M_IMP) {
+    if (i == BE_ORIGINE) {
+      if (impEnImpression()) { afficherMessage("Impression en cours"); return; }
+      gcodeImp("G28", 400); afficherMessage("Origine en cours...");
+    } else if (i == BE_RETOUR) {
+      gcodeImp("M140 S" + String(CHAUFFE_PLATEAU) + "\nM104 S" + String(CHAUFFE_BUSE), 1500);
+      afficherMessage("Prechauffe PLA");
+    } else if (i == BE_SONDE) {
+      if (actionImp("/printer/print/cancel")) afficherMessage("Impression annulee");
+    }
+    return;
+  }
   switch (i) {
     case BE_ORIGINE:
       if (cnc.connected()) { envoyer("$H"); afficherMessage("Prise d'origine"); }
@@ -662,6 +908,15 @@ void gererTactile() {
       for (int i = 0; i < NB_BE; i++) if (dedans(be[i], x, y)) {
         if (i == BE_PAS)            { modePas = (modePas + 1) % 4; rafraichirBouton(i); }
         else if (i == BE_VIT)       { rapide = !rapide; rafraichirBouton(i); }
+        else if (machine == M_IMP && i == BE_DEBLOQUER) {
+          if (klippyEtat == "shutdown" || klippyEtat == "error") { actionImp("/printer/firmware_restart"); afficherMessage("Redemarrage..."); }
+          else if (impEnImpression()) afficherMessage("Impression en cours");
+          else { gcodeImp("M84", 1500); afficherMessage("Moteurs coupes"); }
+        }
+        else if (machine == M_IMP && i == BE_RETOUR && (cBuse > 0 || cPlat > 0)) {
+          gcodeImp("M104 S0\nM140 S0", 1500); afficherMessage("Chauffe arretee");
+        }
+        else if (machine == M_IMP && i == BE_SONDE && !impEnImpression()) afficherMessage("Pas d'impression en cours");
         else if (i == BE_DEBLOQUER) { envoyer("$X"); afficherMessage("Deblocage"); }
         else                        { confirmation = i; dessinerConfirmation(); }
       }
@@ -675,6 +930,7 @@ void gererTactile() {
 //  MENU RÉGLAGES (toucher la barre du haut de l'écran)
 // ============================================================
 const BoutonEcran bmRetour  = {4, 4, 100, 30};
+const BoutonEcran bmMachine = {110, 4, 206, 30};
 const BoutonEcran bmWifi    = {4, 150, 102, 40};
 const BoutonEcran bmIp      = {109, 150, 102, 40};
 const BoutonEcran bmCherche = {214, 150, 102, 40};
@@ -704,10 +960,11 @@ void texteInfo(const String& t, int y, uint16_t coul) {
 
 void ouvrirMenu() {
   ecranActif = E_MENU;
-  titreEcran("REGLAGES");
+  titreEcran("");
+  dessinerBouton(bmMachine, machine == M_IMP ? "MACHINE : IMPRIMANTE 3D" : "MACHINE : CNC", machine == M_IMP ? 0x001F : 0x0400);
   dessinerBouton(bmWifi, "CHOISIR\nWI-FI", 0x0410);
-  dessinerBouton(bmIp, "IP DE\nLA CNC", C_BOUTON);
-  dessinerBouton(bmCherche, "CHERCHER\nLA CNC", 0x8A22);
+  dessinerBouton(bmIp, machine == M_IMP ? "IP DE\nL'IMPRIM." : "IP DE\nLA CNC", C_BOUTON);
+  dessinerBouton(bmCherche, machine == M_IMP ? "CHERCHER\nL'IMPRIM." : "CHERCHER\nLA CNC", 0x8A22);
   dessinerBouton(bmCalib, "CALIBRER\nECRAN", C_BOUTON);
   dessinerBouton(bmJoy, "SENS\nJOYSTICKS", 0x0410);
   dessinerBouton(bmTest, "TEST\nCABLAGE", 0x8A22);
@@ -723,7 +980,10 @@ void majMenu() {            // infos rafraîchies pendant que le menu est ouvert
   lireBatterie();
   String l1 = "Wi-Fi : " + wifiNom + (w ? "  (connecte)" : "  (non connecte)");
   String l2 = "IP telecommande : " + (w ? WiFi.localIP().toString() : String("-"));
-  String l3 = "IP CNC : " + cncIp + ":" + String(cncPort) + (cncAReponduConnexion && cnc.connected() ? "  (OK)" : "  (introuvable)");
+  bool okM = machine == M_IMP ? impOk : (cncAReponduConnexion && cnc.connected());
+  String l3 = machine == M_IMP ? "IP imprimante : " + impIp + ":" + String(IMP_PORT)
+                               : "IP CNC : " + cncIp + ":" + String(cncPort);
+  l3 += okM ? "  (OK)" : "  (introuvable)";
   String l4 = (w ? "Wi-Fi " + String(WiFi.RSSI()) + " dBm" : String("Wi-Fi -"))
              + "  |  Batt. " + String(battVolts, 2) + "V " + (enCharge() ? String("(charge)") : String(battPct) + "%");
   String tout = l1 + l2 + l3 + l4;
@@ -731,7 +991,7 @@ void majMenu() {            // infos rafraîchies pendant que le menu est ouvert
   cacheMenu = tout;
   texteInfo(l1, 56, w ? TFT_WHITE : TFT_ORANGE);
   texteInfo(l2, 80, TFT_WHITE);
-  texteInfo(l3, 104, (cncAReponduConnexion && cnc.connected()) ? TFT_GREENYELLOW : TFT_ORANGE);
+  texteInfo(l3, 104, okM ? TFT_GREENYELLOW : TFT_ORANGE);
   texteInfo(l4, 128, 0xBDF7);
 }
 
@@ -901,7 +1161,7 @@ void dessinerPave() {
   ecran.setFont(&fonts::FreeSansBold9pt7b);
   ecran.setTextColor(TFT_WHITE, C_TITRE);
   ecran.setTextDatum(textdatum_t::middle_center);
-  ecran.drawString("IP DE LA CNC", 212, 19);
+  ecran.drawString(machine == M_IMP ? "IP DE L'IMPRIMANTE" : "IP DE LA CNC", 212, 19);
   dessinerSaisie();
   for (int r = 0; r < 3; r++)
     for (int c = 0; c < 4; c++)
@@ -920,15 +1180,18 @@ uint8_t candHote[MAX_CANDIDATS];
 uint16_t candPort[MAX_CANDIDATS];
 int nbCandidats = 0;
 
+uint16_t portsScan[2] = {8080, 23};
+int nbPortsScan = 2;
+
 void balayerLot(IPAddress moi, int h0, int nbHotes, int delaiMs) {
-  const uint16_t ports[2] = {8080, 23};
+  const uint16_t* ports = portsScan;
   int fd[8], hote[8];
   uint16_t port[8];
   int n = 0;
   for (int i = 0; i < nbHotes; i++) {
     int h = h0 + i;
     if (h < 1 || h > 254 || h == moi[3]) continue;
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < nbPortsScan; k++) {
       int f = socket(AF_INET, SOCK_STREAM, 0);
       if (f < 0) continue;
       fcntl(f, F_SETFL, fcntl(f, F_GETFL, 0) | O_NONBLOCK);
@@ -982,7 +1245,48 @@ bool estUneCnc(IPAddress ip, uint16_t port) {
   return ok;
 }
 
+bool estUneImprimante(IPAddress ip) {
+  String ancien = impIp;
+  impIp = ip.toString();
+  int code;
+  String rep = requeteImp("/server/info", false, 2000, code);
+  impIp = ancien;
+  return code == 200 && rep.indexOf("klippy") >= 0;
+}
+
+void chercherImprimante() {
+  if (WiFi.status() != WL_CONNECTED) { texteInfo("Pas de Wi-Fi : choisir le Wi-Fi d'abord", 128, TFT_ORANGE); return; }
+  IPAddress moi = WiFi.localIP();
+  titreEcran("RECHERCHE IMPRIMANTE");
+  texteInfo("Toucher l'ecran pour arreter", 210, 0xBDF7);
+  portsScan[0] = IMP_PORT; nbPortsScan = 1;
+  nbCandidats = 0;
+  bool arret = false;
+  for (int h = 1; h < 255 && !arret; h += 8) {
+    texteInfo("Balayage : " + String(moi[0]) + "." + String(moi[1]) + "." + String(moi[2]) + "." + String(h) + " ...", 80, TFT_WHITE);
+    ecran.fillRect(10, 110, 300 * h / 254, 14, 0x8A22);
+    ecran.drawRect(10, 110, 300, 14, TFT_WHITE);
+    balayerLot(moi, h, 8, 900);
+    texteInfo("Appareils a verifier : " + String(nbCandidats), 145, 0xBDF7);
+    int32_t tx, ty;
+    if (ecran.getTouch(&tx, &ty)) arret = true;
+  }
+  portsScan[0] = 8080; portsScan[1] = 23; nbPortsScan = 2;
+  bool trouve = false;
+  for (int i = 0; i < nbCandidats && !trouve; i++) {
+    IPAddress ip(moi[0], moi[1], moi[2], candHote[i]);
+    texteInfo("Verification : " + ip.toString(), 80, TFT_WHITE);
+    if (estUneImprimante(ip)) { impIp = ip.toString(); memoire.putString("ipImp", impIp); trouve = true; }
+  }
+  if (trouve) texteInfo("Imprimante trouvee : " + impIp, 175, TFT_GREENYELLOW);
+  else texteInfo("Aucune imprimante Klipper (port 7125)", 175, TFT_ORANGE);
+  delay(2500);
+  impOk = false; tImpPoll = 0;
+  ouvrirMenu();
+}
+
 void chercherCnc() {
+  if (machine == M_IMP) { chercherImprimante(); return; }
   if (WiFi.status() != WL_CONNECTED) { texteInfo("Pas de Wi-Fi : choisir le Wi-Fi d'abord", 128, TFT_ORANGE); return; }
   cnc.stop();
   jogActif = false;
@@ -1151,12 +1455,26 @@ void testCablage() {
   }
 }
 
+// ---------- Changement de machine (CNC <-> imprimante 3D) ----------
+void changerMachine(int m) {
+  if (jogActif) envoyerTempsReel(0x85);
+  jogActif = false;
+  cnc.stop();
+  machine = m;
+  memoire.putInt("mach", machine);
+  impOk = false; impEtat = "?"; klippyEtat = "?"; tImpPoll = 0;
+  etatGrbl = "?"; cncAReponduConnexion = false; tTentative = 0;
+  for (int a = 0; a < 3; a++) pos[a] = 0;
+  ouvrirMenu();
+}
+
 // ---------- Touches dans les menus ----------
 void toucheMenus(int x, int y) {
   if (ecranActif == E_MENU) {
     if (dedans(bmRetour, x, y))       fermerMenu();
+    else if (dedans(bmMachine, x, y)) changerMachine(machine == M_CNC ? M_IMP : M_CNC);
     else if (dedans(bmWifi, x, y))    scannerWifi();
-    else if (dedans(bmIp, x, y))      { ecranActif = E_IP; saisie = cncIp; dessinerPave(); }
+    else if (dedans(bmIp, x, y))      { ecranActif = E_IP; saisie = (machine == M_IMP) ? impIp : cncIp; dessinerPave(); }
     else if (dedans(bmCherche, x, y)) chercherCnc();
     else if (dedans(bmCalib, x, y))   { calibrerTactile(); ouvrirMenu(); }
     else if (dedans(bmJoy, x, y))     { reglerSensJoysticks(); ouvrirMenu(); }
@@ -1195,7 +1513,12 @@ void toucheMenus(int x, int y) {
     if (dedans(bpEff, x, y))     { saisie = ""; dessinerSaisie(); return; }
     if (dedans(bpOk, x, y)) {
       IPAddress ip;
-      if (ip.fromString(saisie)) {
+      if (ip.fromString(saisie) && machine == M_IMP) {
+        impIp = ip.toString();
+        memoire.putString("ipImp", impIp);
+        impOk = false; tImpPoll = 0;
+        ouvrirMenu();
+      } else if (ip.fromString(saisie)) {
         cncIp = ip.toString();
         memoire.putString("ip", cncIp);
         cnc.stop();
@@ -1224,6 +1547,18 @@ void gererBoutons() {
   Bouton* tous[] = {&bPas, &bVit, &bZeroXY, &bZeroZ, &bPause, &bArret};
   for (auto b : tous) b->lire();
 
+  if (machine == M_IMP) {
+    if (bArret.appuye) { actionImp("/printer/emergency_stop"); afficherMessage("ARRET ! > REDEMARRER"); return; }
+    if (bPas.appuye) { modePas = (modePas + 1) % 4; if (confirmation < 0 && ecranActif == E_PRINCIPAL) rafraichirBouton(BE_PAS); }
+    if (bVit.appuye) { rapide = !rapide;            if (confirmation < 0 && ecranActif == E_PRINCIPAL) rafraichirBouton(BE_VIT); }
+    if (bPause.appuye) {
+      if (impEtat == "paused")        { if (actionImp("/printer/print/resume")) afficherMessage("Reprise"); }
+      else if (impEtat == "printing") { if (actionImp("/printer/print/pause"))  afficherMessage("Pause"); }
+      else afficherMessage("Pas d'impression en cours");
+    }
+    if (bZeroXY.appuye || bZeroZ.appuye) afficherMessage("Sans effet sur l'imprimante");
+    return;
+  }
   if (bArret.appuye) {
     envoyerTempsReel(0x85);
     envoyerTempsReel('!');
@@ -1285,7 +1620,13 @@ void dessinerBatterie(int x, int y, uint16_t fond) {   // icône 34 x 16 dans la
 
 void gererVoyant() {
   bool on;
-  if (!cnc.connected())              on = (millis() / 1000) % 2;   // lent : pas connecté
+  if (machine == M_IMP) {
+    if (!impOk)                                        on = (millis() / 1000) % 2;
+    else if (klippyEtat != "ready" || impEtat == "error") on = (millis() / 150) % 2;
+    else if (impEtat == "printing")                    on = (millis() / 400) % 2;
+    else                                               on = true;
+  }
+  else if (!cnc.connected())         on = (millis() / 1000) % 2;   // lent : pas connecté
   else if (etatGrbl == "Alarm")      on = (millis() / 150) % 2;    // rapide : alarme
   else if (etatGrbl == "Run")        on = (millis() / 400) % 2;    // moyen : usinage
   else                               on = true;                    // fixe : prêt
@@ -1390,10 +1731,10 @@ void setup() {
   ecran.setFont(&fonts::FreeSansBold18pt7b);
   ecran.setTextColor(TFT_ORANGE);
   ecran.setTextDatum(textdatum_t::middle_center);
-  ecran.drawString("TTC450", 160, 100);
+  ecran.drawString(machine == M_IMP ? "K2" : "TTC450", 160, 100);
   ecran.setFont(&fonts::FreeSans9pt7b);
   ecran.setTextColor(TFT_WHITE);
-  ecran.drawString("Telecommande CNC", 160, 140);
+  ecran.drawString(machine == M_IMP ? "Telecommande imprimante 3D" : "Telecommande CNC", 160, 140);
 
   // Réglages mémorisés (sinon valeurs du haut du programme)
   wifiNom = memoire.getString("ssid", WIFI_NOM);
@@ -1404,6 +1745,8 @@ void setup() {
   sgnX = memoire.getInt("sgnX", 1);
   sgnY = memoire.getInt("sgnY", 1);
   sgnZ = memoire.getInt("sgnZ", 1);
+  machine = memoire.getInt("mach", M_CNC);
+  impIp   = memoire.getString("ipImp", IMP_IP);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -1418,8 +1761,8 @@ void setup() {
 
 void loop() {
   gererMaj();
-  gererConnexion();
-  lireCNC();
+  if (machine == M_IMP) gererImprimante();
+  else { gererConnexion(); lireCNC(); }
   gererBoutons();
   gererTactile();
   if (ecranActif == E_PRINCIPAL) { gererJog(); majEcran(); }
